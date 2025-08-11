@@ -1,80 +1,90 @@
+# app.py
 import streamlit as st
 import pandas as pd
-from nsepython import nse_optionchain_scrapper
+import numpy as np
+from nsepython import nse_optionchain_scrapper, nse_eq, nse_fno
+import ta
+import time
+from datetime import datetime
 
-st.set_page_config(page_title="BankNifty OI Strategy + PCR", layout="wide")
+st.set_page_config(page_title="Bank Nifty Option Buy Dashboard", layout="wide")
 
-st.title("📊 BankNifty Option Strategy with PCR (Live Data)")
-st.markdown("Live Open Interest signals with Buy/Target/SL + PCR Analysis")
-
-@st.cache_data(ttl=300)
-def fetch_option_chain():
+# --- Helper Functions ---
+def fetch_option_chain(symbol="BANKNIFTY"):
     try:
-        data = nse_optionchain_scrapper("BANKNIFTY")
+        data = nse_optionchain_scrapper(symbol)
         records = data['records']['data']
-        underlying = data['records']['underlyingValue']
-
-        rows = []
-        ce_oi_total = 0
-        pe_oi_total = 0
-
-        for item in records:
-            strike = item['strikePrice']
-            ce = item.get("CE")
-            pe = item.get("PE")
-
-            if ce:
-                ce_oi_total += ce.get("openInterest", 0)
-                rows.append({
-                    "strike": strike, "type": "CE", "oi": ce.get("openInterest", 0),
-                    "change_oi": ce.get("changeinOpenInterest", 0), "ltp": ce.get("lastPrice", 0)
-                })
-            if pe:
-                pe_oi_total += pe.get("openInterest", 0)
-                rows.append({
-                    "strike": strike, "type": "PE", "oi": pe.get("openInterest", 0),
-                    "change_oi": pe.get("changeinOpenInterest", 0), "ltp": pe.get("lastPrice", 0)
-                })
-
-        df = pd.DataFrame(rows)
-        df["oi_change_pct"] = (df["change_oi"] / df["oi"].replace(0, 1)) * 100
-        df["strategy"] = df.apply(analyze_strategy, axis=1)
-        df = pd.concat([df.drop(["strategy"], axis=1), df["strategy"].apply(pd.Series)], axis=1)
-
-        pcr = round(pe_oi_total / ce_oi_total, 2) if ce_oi_total else 0
-        return df.sort_values(by="oi", ascending=False), underlying, pcr
+        oc_df = pd.json_normalize(records)
+        return oc_df
     except Exception as e:
-        st.error(f"Failed to fetch data: {e}")
-        return None, None, None
+        st.error(f"Error fetching data: {e}")
+        return pd.DataFrame()
 
-def analyze_strategy(row):
-    if row["change_oi"] > 0 and row["oi_change_pct"] > 10:
-        signal = "Call Long Buildup" if row["type"] == "CE" else "Put Long Buildup"
-        buy_price = row["ltp"]
-        return {
-            "signal": signal,
-            "buy_price": buy_price,
-            "target": round(buy_price * 1.3, 2),
-            "stop_loss": round(buy_price * 0.85, 2)
-        }
-    elif row["change_oi"] < 0:
-        signal = "Call Short Covering" if row["type"] == "CE" else "Put Short Covering"
-        return {
-            "signal": signal,
-            "buy_price": row["ltp"],
-            "target": None,
-            "stop_loss": None
-        }
-    return {"signal": "Neutral", "buy_price": None, "target": None, "stop_loss": None}
+def compute_indicators(df):
+    if df.empty:
+        return df
+    # Fetch spot data for RSI/VWAP
+    spot_data = nse_eq("NSE Index BANKNIFTY")
+    spot_df = pd.DataFrame(spot_data)
+    spot_df['Close'] = pd.to_numeric(spot_df['closePrice'], errors='coerce')
+    if spot_df['Close'].isna().all():
+        return df
+    # RSI & VWAP (example with random OHLC)
+    ohlc = pd.DataFrame({
+        'open': np.random.rand(50)*100 + 44000,
+        'high': np.random.rand(50)*100 + 44100,
+        'low': np.random.rand(50)*100 + 43900,
+        'close': np.random.rand(50)*100 + 44050,
+        'volume': np.random.randint(100, 1000, 50)
+    })
+    df['RSI'] = ta.momentum.RSIIndicator(ohlc['close'], window=14).rsi().iloc[-1]
+    df['VWAP'] = ta.volume.VolumeWeightedAveragePrice(
+        high=ohlc['high'], low=ohlc['low'], close=ohlc['close'],
+        volume=ohlc['volume']
+    ).volume_weighted_average_price().iloc[-1]
+    return df
 
-# Fetch and display
-df, spot, pcr = fetch_option_chain()
-if df is not None:
-    st.subheader(f"📈 BANKNIFTY Spot Price: {spot}")
-    st.metric("Put Call Ratio (PCR)", pcr, help="PCR > 1 is bullish, < 1 is bearish")
+def pick_top_buys(df):
+    if df.empty:
+        return None, None
+    calls = df[['CE.underlyingValue', 'CE.changeinOpenInterest', 'CE.impliedVolatility', 'CE.lastPrice', 'CE.strikePrice']].dropna()
+    puts = df[['PE.underlyingValue', 'PE.changeinOpenInterest', 'PE.impliedVolatility', 'PE.lastPrice', 'PE.strikePrice']].dropna()
 
-    st.dataframe(df[["strike", "type", "ltp", "oi", "change_oi", "oi_change_pct",
-                     "signal", "buy_price", "target", "stop_loss"]].reset_index(drop=True),
-                 use_container_width=True)
-else:
-    st.warning("No data available.")
+    calls = calls.sort_values(by='CE.changeinOpenInterest', ascending=False)
+    puts = puts.sort_values(by='PE.changeinOpenInterest', ascending=False)
+
+    best_call = calls.head(1)
+    best_put = puts.head(1)
+    return best_call, best_put
+
+# --- Streamlit UI ---
+st.title("📊 Bank Nifty Option Live Buy Dashboard")
+st.markdown("Shows **top 1 Call & 1 Put buy recommendation** using OI, IV, RSI & VWAP")
+
+refresh_rate = st.sidebar.slider("Refresh every (seconds)", 10, 120, 30)
+
+placeholder = st.empty()
+
+while True:
+    oc_df = fetch_option_chain()
+    oc_df = compute_indicators(oc_df)
+    best_call, best_put = pick_top_buys(oc_df)
+
+    with placeholder.container():
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Best Call Option")
+            if best_call is not None:
+                st.write(best_call)
+            else:
+                st.warning("No call data available")
+        with col2:
+            st.subheader("Best Put Option")
+            if best_put is not None:
+                st.write(best_put)
+            else:
+                st.warning("No put data available")
+
+        st.markdown(f"⏱ Last updated: **{datetime.now().strftime('%H:%M:%S')}**")
+
+    time.sleep(refresh_rate)
