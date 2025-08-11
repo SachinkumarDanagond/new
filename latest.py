@@ -1,90 +1,123 @@
-# app.py
+# app_live_banknifty.py
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-from nsepython import nse_optionchain_scrapper, nse_eq, nse_fno
-import ta
-import time
+import requests
 from datetime import datetime
+import time
+from ta.momentum import RSIIndicator
+from ta.volume import VolumeWeightedAveragePrice
+from nsepython import nse_optionchain_scrapper
 
-st.set_page_config(page_title="Bank Nifty Option Buy Dashboard", layout="wide")
+st.set_page_config(page_title="Live Bank Nifty Option Buys", layout="wide")
+st.title("Live Bank Nifty Intraday + 2-Buy Signals Dashboard")
 
-# --- Helper Functions ---
+# Persistent session for NSE access
+session = requests.Session()
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com",
+}
+
+def fetch_intraday(symbol="BANKNIFTY", interval="5"):
+    try:
+        # initialize cookies
+        session.get("https://www.nseindia.com", headers=HEADERS, timeout=5)
+        url = f"https://www.nseindia.com/api/chart-databyindex?index={symbol}&interval={interval}"
+        resp = session.get(url, headers=HEADERS, timeout=5)
+        data = resp.json()
+        timestamps = data["metadata"]["times"]
+        ohlcvs = data["data"]
+        df = pd.DataFrame(ohlcvs, columns=["Open", "High", "Low", "Close", "Volume"])
+        df["Datetime"] = pd.to_datetime(timestamps, unit="ms")
+        return df.set_index("Datetime")
+    except Exception as e:
+        st.error(f"Intraday fetch error: {e}")
+        return pd.DataFrame()
+
 def fetch_option_chain(symbol="BANKNIFTY"):
     try:
-        data = nse_optionchain_scrapper(symbol)
-        records = data['records']['data']
-        oc_df = pd.json_normalize(records)
-        return oc_df
+        df = nse_optionchain_scrapper(symbol)["records"]["data"]
+        return pd.json_normalize(df)
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
+        st.error(f"Option chain fetch error: {e}")
         return pd.DataFrame()
 
 def compute_indicators(df):
     if df.empty:
         return df
-    # Fetch spot data for RSI/VWAP
-    spot_data = nse_eq("NSE Index BANKNIFTY")
-    spot_df = pd.DataFrame(spot_data)
-    spot_df['Close'] = pd.to_numeric(spot_df['closePrice'], errors='coerce')
-    if spot_df['Close'].isna().all():
-        return df
-    # RSI & VWAP (example with random OHLC)
-    ohlc = pd.DataFrame({
-        'open': np.random.rand(50)*100 + 44000,
-        'high': np.random.rand(50)*100 + 44100,
-        'low': np.random.rand(50)*100 + 43900,
-        'close': np.random.rand(50)*100 + 44050,
-        'volume': np.random.randint(100, 1000, 50)
-    })
-    df['RSI'] = ta.momentum.RSIIndicator(ohlc['close'], window=14).rsi().iloc[-1]
-    df['VWAP'] = ta.volume.VolumeWeightedAveragePrice(
-        high=ohlc['high'], low=ohlc['low'], close=ohlc['close'],
-        volume=ohlc['volume']
-    ).volume_weighted_average_price().iloc[-1]
+    vwap = VolumeWeightedAveragePrice(df["High"], df["Low"], df["Close"], df["Volume"], window=14)
+    df["VWAP"] = vwap.volume_weighted_average_price()
+    rsi = RSIIndicator(df["Close"], window=14)
+    df["RSI"] = rsi.rsi()
     return df
 
-def pick_top_buys(df):
-    if df.empty:
-        return None, None
-    calls = df[['CE.underlyingValue', 'CE.changeinOpenInterest', 'CE.impliedVolatility', 'CE.lastPrice', 'CE.strikePrice']].dropna()
-    puts = df[['PE.underlyingValue', 'PE.changeinOpenInterest', 'PE.impliedVolatility', 'PE.lastPrice', 'PE.strikePrice']].dropna()
+def pick_top_buy(oc_df, side="CE"):
+    key = f"{side}.changeinOpenInterest"
+    if oc_df.empty or key not in oc_df.columns:
+        return None
+    col = oc_df[[f"{side}.strikePrice", key, f"{side}.lastPrice", f"{side}.impliedVolatility"]].dropna()
+    if col.empty:
+        return None
+    best = col.sort_values(by=key, ascending=False).iloc[0]
+    return best
 
-    calls = calls.sort_values(by='CE.changeinOpenInterest', ascending=False)
-    puts = puts.sort_values(by='PE.changeinOpenInterest', ascending=False)
+# Sidebar refresh control
+refresh = st.sidebar.slider("Auto-refresh every (s)", 30, 300, 60)
+manual_refresh = st.sidebar.button("Refresh Now")
 
-    best_call = calls.head(1)
-    best_put = puts.head(1)
-    return best_call, best_put
-
-# --- Streamlit UI ---
-st.title("📊 Bank Nifty Option Live Buy Dashboard")
-st.markdown("Shows **top 1 Call & 1 Put buy recommendation** using OI, IV, RSI & VWAP")
-
-refresh_rate = st.sidebar.slider("Refresh every (seconds)", 10, 120, 30)
-
+# Main loop with placeholder for live update
 placeholder = st.empty()
 
-while True:
-    oc_df = fetch_option_chain()
-    oc_df = compute_indicators(oc_df)
-    best_call, best_put = pick_top_buys(oc_df)
+def render():
+    df_intraday = fetch_intraday()
+    df_intraday = compute_indicators(df_intraday)
+
+    oc = fetch_option_chain()
+    best_ce = pick_top_buy(oc, "CE")
+    best_pe = pick_top_buy(oc, "PE")
 
     with placeholder.container():
         col1, col2 = st.columns(2)
         with col1:
-            st.subheader("Best Call Option")
-            if best_call is not None:
-                st.write(best_call)
+            st.subheader("Intraday Price vs VWAP")
+            if not df_intraday.empty:
+                st.line_chart(df_intraday[["Close", "VWAP"]])
+                st.subheader("RSI")
+                st.line_chart(df_intraday["RSI"])
             else:
-                st.warning("No call data available")
+                st.write("No intraday data.")
+
         with col2:
-            st.subheader("Best Put Option")
-            if best_put is not None:
-                st.write(best_put)
+            st.subheader("Top Buy Call Signal")
+            if best_ce is not None:
+                st.write(f"Strike: {best_ce[f'CE.strikePrice']}")
+                st.write(f"OI Change: {best_ce[f'CE.changeinOpenInterest']}")
+                st.write(f"IV: {best_ce[f'CE.impliedVolatility']:.2f}")
+                st.write(f"LTP: {best_ce[f'CE.lastPrice']}")
             else:
-                st.warning("No put data available")
+                st.write("No Call signal.")
 
-        st.markdown(f"⏱ Last updated: **{datetime.now().strftime('%H:%M:%S')}**")
+            st.subheader("Top Buy Put Signal")
+            if best_pe is not None:
+                st.write(f"Strike: {best_pe[f'PE.strikePrice']}")
+                st.write(f"OI Change: {best_pe[f'PE.changeinOpenInterest']}")
+                st.write(f"IV: {best_pe[f'PE.impliedVolatility']:.2f}")
+                st.write(f"LTP: {best_pe[f'PE.lastPrice']}")
+            else:
+                st.write("No Put signal.")
 
-    time.sleep(refresh_rate)
+            st.markdown(f"**Last update**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+# Initial render
+render()
+
+# Auto-refresh loop
+while True:
+    if manual_refresh:
+        render()
+    else:
+        time.sleep(refresh)
+        render()
